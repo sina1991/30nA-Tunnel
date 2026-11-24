@@ -300,6 +300,58 @@ class ManagerTests(unittest.TestCase):
         self.assertEqual(authorized.read_bytes(),b"restrict "+public)
         self.assertEqual(authorized.stat().st_mode&0o777,0o600)
 
+    def test_fresh_vps_uses_zip_key_and_installs_before_python(self):
+        (self.data/"revision").write_text("a"*40)
+        (self.data/"install.sh").write_text("# test installer")
+        (self.data/"manager.py").write_bytes(b"installed code")
+        installed = False
+        commands = []
+        def execute(endpoint,args,**kwargs):
+            nonlocal installed
+            commands.append(args)
+            if args[0] == "python3" and not installed:
+                raise AssertionError("Python requested on a fresh VPS")
+            if args[0] == "bash":
+                self.assertTrue(endpoint["bootstrap"])
+                installed=True
+                return response("Installed")
+            if args == ["cat","/etc/machine-id"]:
+                return response("dashboard" if endpoint.get("dashboard") else "fresh-vps")
+            if args == ["cat",str(self.data/"manager.py")]:
+                return response("installed code")
+            return response()
+        def register(endpoint):
+            self.assertTrue(installed)
+            self.assertTrue(endpoint["bootstrap"])
+        with patch.object(m,"BASE",self.data), patch("pathlib.Path.is_file",return_value=True),              patch.object(m,"execute",side_effect=execute), patch.object(m,"run",return_value=response()) as run,              patch.object(m,"register_management",side_effect=register),              patch("builtins.input",side_effect=["178.83.46.45",""]):
+            m.enroll_server(self.state)
+        initial=run.call_args_list[0].args[0]
+        self.assertIn("/root/.ssh/30na_windows",initial)
+        self.assertNotIn("/root/.ssh/30na_tunnel_manager",initial)
+        self.assertIn("StrictHostKeyChecking=accept-new",initial)
+        self.assertIn("root@178.83.46.45",initial)
+        self.assertTrue(installed)
+        self.assertLess(next(i for i,args in enumerate(commands) if args[0]=="bash"),
+                        next(i for i,args in enumerate(commands) if args[0]=="python3"))
+        fresh=self.state["servers"]["4"]
+        self.assertNotIn("bootstrap",fresh)
+        self.assertEqual(fresh["host"],"178.83.46.45")
+
+    def test_failed_bootstrap_does_not_register_vps(self):
+        with patch("pathlib.Path.is_file",return_value=True), patch.object(m,"run",
+                side_effect=RuntimeError("Connection refused")),              patch("builtins.input",side_effect=["178.83.46.45","22"]):
+            with self.assertRaisesRegex(RuntimeError,"Connection refused"):
+                m.enroll_server(self.state)
+        self.assertEqual(set(self.state["servers"]),{"1","2","3"})
+
+    def test_timeout_does_not_print_remote_program(self):
+        import subprocess
+        with patch.object(m.subprocess,"run",side_effect=subprocess.TimeoutExpired(["ssh","secret program"],30)):
+            with self.assertRaises(RuntimeError) as error:
+                m.run(["ssh","secret program"])
+        self.assertIn("30 seconds",str(error.exception))
+        self.assertNotIn("secret program",str(error.exception))
+
     def test_menu_has_only_approved_actions(self):
         self.assertIn("3. Tunnel Test",m.MENUS["tunnel"])
         self.assertNotIn("Enable"," ".join(m.MENUS.values()))

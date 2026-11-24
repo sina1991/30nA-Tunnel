@@ -17,7 +17,7 @@ import time
 
 BASE = Path("/opt/tunnel-manager")
 DATA = BASE / "data"
-VERSION = "2.0.0-rc.1"
+VERSION = "2.0.0-rc.2"
 HOST = re.compile(r"[A-Za-z0-9][A-Za-z0-9.-]{0,252}")
 ERRORS = (ValueError, KeyError, OSError, RuntimeError, subprocess.SubprocessError)
 SSH_OPTIONS = ["-o", "BatchMode=yes", "-o", "ConnectTimeout=8",
@@ -28,7 +28,10 @@ STATE = DATA / "state.json"
 
 def run(args, *, check=True, data=None, timeout=30):
     stream = {"stdin": subprocess.DEVNULL} if data is None else {"input": data}
-    result = subprocess.run(args, **stream, capture_output=True, timeout=timeout)
+    try:
+        result = subprocess.run(args, **stream, capture_output=True, timeout=timeout)
+    except subprocess.TimeoutExpired as error:
+        raise RuntimeError(f"Operation timed out after {timeout} seconds.") from error
     if check and result.returncode:
         detail = result.stderr.decode(errors="replace").strip()
         raise RuntimeError(detail or f"{args[0]} exited with code {result.returncode}")
@@ -67,7 +70,8 @@ def locked():
 
 def ssh_command(endpoint):
     args = ["ssh", *SSH_OPTIONS, "-p", str(endpoint.get("ssh_port", 22))]
-    for filename in ("30na_tunnel_manager", "30na_windows"):
+    filenames = ("30na_windows",) if endpoint.get("bootstrap") else ("30na_tunnel_manager", "30na_windows")
+    for filename in filenames:
         key = Path("/root/.ssh") / filename
         if key.is_file():
             args += ["-i", str(key)]
@@ -78,7 +82,10 @@ def ssh_command(endpoint):
 def execute(endpoint, args, **kwargs):
     if endpoint.get("dashboard"):
         return run(args, **kwargs)
-    return run([*ssh_command(endpoint), shlex.join(list(map(str, args)))], **kwargs)
+    try:
+        return run([*ssh_command(endpoint), shlex.join(list(map(str, args)))], **kwargs)
+    except RuntimeError as error:
+        raise RuntimeError(f"SSH {endpoint['host']}:{endpoint.get('ssh_port', 22)} — {error}") from error
 
 
 def save(state):
@@ -631,17 +638,17 @@ def enroll_server(state):
         raise ValueError("Enter an IPv4 address or a DNS hostname.")
     port = input_port("SSH Port", 22)
     endpoint = dict(host=host, ssh_port=port, user="root")
-    manager_key = Path("/root/.ssh/30na_tunnel_manager")
-    if not manager_key.exists():
-        run(["ssh-keygen", "-q", "-t", "ed25519", "-N", "", "-f", str(manager_key)])
-    if execute(endpoint, ["true"], check=False).returncode:
-        command = ["ssh-copy-id", "-p", str(port), "-i", str(manager_key) + ".pub",
-                   "-o", "ConnectTimeout=8"]
-        admin_key = Path("/root/.ssh/30na_windows")
-        if admin_key.exists():
-            command += ["-o", f"IdentityFile={admin_key}"]
-        subprocess.run([*command, f"root@{host}"], check=True, timeout=120)
-    register_management(endpoint)
+    admin_key = Path("/root/.ssh/30na_windows")
+    if not admin_key.is_file() or not admin_key.with_suffix(".pub").is_file():
+        raise ValueError("Restore the ZIP key pair with install.sh before adding a VPS.")
+    endpoint["bootstrap"] = True
+    # A fresh VPS only needs root SSH and a shell. No Python is invoked here.
+    print(f"Connecting to root@{host}:{port} with the ZIP key...", flush=True)
+    command = ssh_command(endpoint)
+    strict = command.index("StrictHostKeyChecking=yes")
+    command[strict] = "StrictHostKeyChecking=accept-new"
+    command += ["true"]
+    run(command)
     machine = endpoint_identity(endpoint)
     if machine == endpoint_identity(state["servers"][state["local_id"]]):
         raise ValueError("The dashboard VPS is already registered.")
@@ -660,6 +667,13 @@ def enroll_server(state):
     print(text(result))
     if execute(endpoint, ["cat", str(BASE / "manager.py")]).stdout != (BASE / "manager.py").read_bytes():
         raise RuntimeError("The peer did not install the selected version.")
+    print("Checking the installed VPS...", flush=True)
+    execute(endpoint, ["python3", "-c", "import sys; print(sys.version.split()[0])"])
+    manager_key = Path("/root/.ssh/30na_tunnel_manager")
+    if not manager_key.is_file():
+        run(["ssh-keygen", "-q", "-t", "ed25519", "-N", "", "-f", str(manager_key)])
+    register_management(endpoint)
+    endpoint.pop("bootstrap")
     sid = next((key for key, server in state["servers"].items()
                 if server["host"] == host and server.get("ssh_port", 22) == port), None)
     sid = sid or str(max(map(int, state["servers"]), default=0) + 1)
