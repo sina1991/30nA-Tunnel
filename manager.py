@@ -334,7 +334,16 @@ def remove_tunnel(state, tid):
             execute(server, ["/usr/sbin/sshd", "-t"])
             execute(server, ["systemctl", "reload", "ssh"])
             if execute(server, ["id", account], check=False).returncode == 0:
-                execute(server, ["userdel", account])
+                # sshd may still be reaping the session after the port closes.
+                deadline = time.monotonic() + 15
+                while True:
+                    deletion = execute(server, ["userdel", account], check=False)
+                    if deletion.returncode in (0, 6):
+                        break
+                    if deletion.returncode != 8 or time.monotonic() >= deadline:
+                        raise RuntimeError(deletion.stderr.decode(errors="replace").strip()
+                                           or f"Could not delete tunnel account {account}")
+                    time.sleep(0.3)
         key = f"{BASE}/data/{account}.key"
         execute(client, ["rm", "-f", key, key + ".pub", key + ".hosts",
                          f"{BASE}/data/{account}.hosts"])

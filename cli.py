@@ -242,16 +242,9 @@ def tunnel_action(state, action, args):
     return True
 
 
-MODULES = {"-vps": vps_action, "-tunnel": tunnel_action}
+def management_module(module, rest):
+    argv = [module, *rest]
 
-
-def main(argv):
-    if not argv or argv == ["-h"]:
-        print("30na " + " | ".join(MODULES) + "\n30na -vps -tunnel\nUse MODULE -h for command examples.")
-        return 0
-    module, *rest = argv
-    if module not in MODULES:
-        raise ValueError("Unknown module. Run 30na -h.")
     if rest == ["-h"]:
         for action in ("-add", "-remove", "-test"):
             parser_for(module, action).print_usage()
@@ -285,8 +278,24 @@ def main(argv):
                 action = "-add"
                 args = argparse.Namespace(local=pair[0], remote=pair[1], local_port=listen,
                                           remote_port=target, mode=mode)
-            success = MODULES[module](state, action, args)
+            handler = vps_action if module == "-vps" else tunnel_action
+            success = handler(state, action, args)
     return 0 if success else 1
+
+
+# Module handlers receive the switch and its remaining argv. Each owns its
+# parser, privileges and storage; dispatch alone never opens the registry.
+MODULES = {"-vps": management_module, "-tunnel": management_module}
+
+
+def main(argv):
+    if not argv or argv == ["-h"]:
+        print("30na " + " | ".join(MODULES) + "\n30na -vps -tunnel\nUse MODULE -h for usage.")
+        return 0
+    module, *rest = argv
+    if module not in MODULES:
+        raise ValueError("Unknown module. Run 30na -h.")
+    return MODULES[module](module, rest)
 
 
 if __name__ == "__main__":

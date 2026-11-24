@@ -5,11 +5,12 @@ permissions:
 jobs:
   ubuntu:
     strategy:
+      fail-fast: false
       matrix:
         os: [ubuntu-22.04, ubuntu-24.04]
     runs-on: ${{ matrix.os }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
       - name: Install integration dependencies
         run: |
           sudo apt-get update -qq

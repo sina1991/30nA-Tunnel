@@ -96,3 +96,20 @@ class CommandTests(unittest.TestCase):
         with patch.object(m, "load", side_effect=AssertionError):
             self.assertIn("-sshkey", self.command("-vps -h")[1])
             self.assertIn("-mode", self.command("-tunnel -h")[1])
+
+    def test_independent_module_does_not_open_tunnel_registry(self):
+        def extension(module, rest):
+            self.assertEqual((module, rest), ("-example", ["-list"]))
+            return 0
+        with patch.dict(cli.MODULES, {"-example": extension}), patch.object(m, "load", side_effect=AssertionError):
+            self.assertEqual(self.command("-example -list")[0], 0)
+
+    def test_silent_target_persists_unverified(self):
+        state = m.load()
+        state["tunnels"]["4"] = dict(local_id="1", remote_id="1", bind="127.0.0.1",
+                                       listen=18443, target=443)
+        import subprocess
+        response = subprocess.CompletedProcess([], 0, b"UNVERIFIED No recognizable application response", b"")
+        with patch.object(m, "listeners", return_value="listening"), patch.object(m, "execute", return_value=response):
+            self.assertEqual(health.check(state, "4", "UP")[0], "UNVERIFIED")
+        self.assertEqual(m.load()["checks"]["4"]["result"], "UNVERIFIED")
