@@ -1,0 +1,23 @@
+name: Tests
+on: [push, pull_request]
+permissions:
+  contents: read
+jobs:
+  ubuntu:
+    strategy:
+      matrix:
+        os: [ubuntu-22.04, ubuntu-24.04]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install test dependencies
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y openssh-server openssh-client p7zip-full iproute2
+      - name: Check shell syntax
+        run: |
+          for file in install.sh 30na-tunnel.sh tunnel.sh health-check.sh lib/restore-key.sh; do
+            bash -n "$file"
+          done
+      - name: Run regression and OpenSSH integration tests
+        run: python3 -m unittest discover -s tests -v
