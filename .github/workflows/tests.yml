@@ -10,14 +10,24 @@ jobs:
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
-      - name: Install test dependencies
+      - name: Install integration dependencies
         run: |
           sudo apt-get update -qq
-          sudo apt-get install -y openssh-server openssh-client p7zip-full iproute2
-      - name: Check shell syntax
+          sudo apt-get install -y openssh-server iproute2
+          sudo mkdir -p /run/sshd
+      - name: Validate and test
         run: |
-          for file in install.sh 30na-tunnel.sh tunnel.sh health-check.sh lib/restore-key.sh; do
-            bash -n "$file"
-          done
-      - name: Run regression and OpenSSH integration tests
-        run: python3 -m unittest discover -s tests -v
+          bash -n install.sh
+          sh -n 30na
+          python3 -W error -m compileall -q .
+          python3 -W error -m unittest discover -s tests -v
+      - name: Exercise installed CLI
+        run: |
+          sudo env THIRTYNA_LOCAL_IPV4="$(ip -4 route get 1.1.1.1 | awk '{for(i=1;i<=NF;i++) if($i=="src"){print $(i+1); exit}}')" bash install.sh
+          sudo bash install.sh
+          sudo 30na -vps -tunnel
+          30na -tunnel -h
+      - name: Exercise native systemd and scoped sshd accounts
+        run: |
+          sudo systemctl start ssh
+          sudo python3 -W error tests/systemd_smoke.py

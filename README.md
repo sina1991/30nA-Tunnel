@@ -1,228 +1,78 @@
-# 30nA-TUNNEL
+# 30na · VPS and SSH tunnel management
 
-نسخهٔ آزمایشی **2.0.0-rc.2** برای تست پذیرش کاربر، پیش از انتشار اولین Release.
+Run commands as root on the Linux manager. This branch is for acceptance testing.
+Ubuntu 22.04 and 24.04 with systemd and OpenSSH are the target platforms.
 
-مدیریت تونل‌های TCP با OpenSSH و systemd از یک ترمینال Ubuntu. هر تونل دو VPS
-مشخص دارد. **Local VPS** پورت ورودی کاربران را نگه می‌دارد و **Remote VPS**
-میزبان سرویس مقصد است.
-
-| Mode | آغازکنندهٔ اتصال SSH | مسیر ترافیک کاربر |
-|---|---|---|
-| Forward | Local VPS | Local Port → Remote Port |
-| Reverse | Remote VPS | Local Port → Remote Port |
-
-## نصب و اجرا
-
-روی VPS مدیریتی با کاربر root اجرا کن. Ubuntu 22.04 و 24.04 هدف این نسخه هستند.
-فایل ZIP را ابتدا در مسیر `/root/30na-SSH-Backup.zip` قرار بده.
-
+## Install the review branch
 ```bash
 clear
-bash <(curl --http1.1 -fsSL --retry 3 https://raw.githubusercontent.com/sina1991/30nA-Tunnel/main/install.sh)
+git clone --branch rewrite/30na-cli --single-branch https://github.com/sina1991/30nA-Tunnel.git 30na-cli
+cd 30na-cli
+bash install.sh
 ```
+To update this checkout, run `git pull --ff-only` and `bash install.sh`.
+A fresh installation lists only this VPS (ID 1). The new registry, application
+and units have independent ownership from the previous manager. Ports already
+occupied by an existing service remain occupied.
 
-در اولین اجرا nano با این متن باز می‌شود. فقط مقدار داخل کوتیشن را جایگزین کن
-و با Ctrl+X، سپس Y و Enter ذخیره کن.
-
-```text
-zip-pass="Input Here"
-```
-
-رمز در فایل متنی `/root/.30na-tunnel-passwords` با مجوز 600 باقی می‌ماند.
-نصاب فایل را به‌صورت داده می‌خواند. در اجراهای بعدی رمز از همین فایل استفاده
-می‌شود. برای تغییر رمز، `nano /root/.30na-tunnel-passwords` را اجرا کن.
-رمز ZIP در خروجی ترمینال یا آرگومان 7-Zip قرار نمی‌گیرد.
-
-نصاب پیش‌نیازها را نصب می‌کند، جفت‌کلید ZIP را اعتبارسنجی می‌کند، کلیدهای
-موجودِ یکسان را نگه می‌دارد و کلید عمومی را یک‌بار ثبت می‌کند. کلید موجود متفاوت
-یا ناقص باعث توقف بازیابی می‌شود. اگر خود کلید SSH passphrase داشته باشد،
-OpenSSH برای بازکردن آن می‌تواند passphrase درخواست کند.
-
-اجرای بعدی داشبورد:
-
+## Register and check a VPS
+The manager needs root SSH access with a verified known_hosts entry and a usable
+private key (or its unlocked identity in the current SSH agent). For a new host,
+verify the host fingerprint against the provider console during the first
+interactive login. On the **Linux manager**:
 ```bash
 clear
-30na-tunnel
+ssh -i /root/.ssh/30na_windows -o IdentitiesOnly=yes root@gr03.30na.top hostname
+30na -vps -add -domain gr03.30na.top -sshkey /root/.ssh/30na_windows
+30na -vps
 ```
-
-مسیر مستقیم برنامه `/opt/tunnel-manager/30na-tunnel.sh` است.
-فایل `tunnel.sh` قدیمی نیز همین برنامه را باز می‌کند.
-کلید مدیریت بدون passphrase روی VPS مدیریتی ساخته می‌شود. فقط کلید عمومی آن
-روی VPSهای ثبت‌شده قرار می‌گیرد. برای هر تونل یک کلید و حساب محدودِ مخصوص همان
-تونل به‌طور خودکار ساخته می‌شود.
-
-## صفحه اصلی و منو
-
-صفحه با هر انتخاب پاک می‌شود. وضعیت VPSها، DNS و تونل‌ها بالای همهٔ منوها
-نمایش داده می‌شود. خروجی در ترمینال رنگی است. `NO_COLOR=1` رنگ‌ها را خاموش
-می‌کند. DNS Check نتیجهٔ resolve آدرس VPS است. ستون TEST زمان آخرین تست را
-دارد و STATE وضعیت فعلی سرویس را نشان می‌دهد.
-
-```text
-30nA-TUNNEL 2.0.0-rc.2
-vps-56001 · 91.216.217.244 · 14:30
-
-VPS
-ID   HOST                  SSH       DNS CHECK
-1    91.216.217.244         LOCAL     OK (14:30)
-2    uk5.30na.top           OK        OK (14:30)
-3    gr02.30na.top          OK        OK (14:30)
-
-TUNNELS
-ID   MODE      LOCAL VPS:PORT          REMOTE VPS:PORT      STATE   TEST
-1    Forward   91.216.217.244:443       uk5.30na.top:443     UP      OK ...
-4    Reverse   91.216.217.244:6677      gr02.30na.top:443    UP      OK ...
-
-1. VPS
-2. Tunnel
-0. Exit
-```
-
-شناسه‌های این مثال نمونه‌اند. همیشه از شماره‌های جدول برنامه استفاده کن.
-
-```mermaid
-flowchart TD
-    Main["30na-tunnel.sh"] --> VPS["1. VPS"]
-    Main --> Tunnel["2. Tunnel"]
-    VPS --> VActions["Add · Remove · VPS Test"]
-    Tunnel --> TActions["Add · Remove · Tunnel Test"]
-    TActions -->|Add| Pair["Local VPS → Remote VPS"]
-    Pair --> Ports["Local Port → Remote Port"]
-    Ports --> Mode["1. Forward · 2. Reverse"]
-    classDef default fill:#fff,stroke:#000,color:#000
-    linkStyle default stroke:#000
-```
-
-### VPS
-
-```text
-1. Add New VPS
-2. Remove VPS
-3. VPS Test
-0. Back
-```
-
-**Add New VPS** دامنه یا IP و پورت SSH را می‌گیرد. پیش‌فرض پورت SSH برابر 22
-است. ورود اولیهٔ root با کلید `/root/.ssh/30na_windows` بازیابی‌شده از ZIP
-انجام می‌شود. کلید عمومی همین جفت‌کلید باید قبلاً برای ورود root در VPS مقصد
-ثبت شده باشد، مثلاً هنگام ساخت VPS در پنل ارائه‌دهنده.
-
-روی VPS تازه فقط دسترسی root از طریق SSH و Ubuntu با systemd لازم است.
-نصاب از طریق SSH اجرا می‌شود و پیش‌نیازها از جمله Python، Git و curl را خودش
-نصب می‌کند. سپس فایل‌های نصب‌شده بررسی می‌شوند، کلید مدیریت ثبت می‌شود و VPS
-پس از موفقیت همهٔ مراحل وارد فهرست می‌شود. خطای نصب باعث ثبت VPS آماده نمی‌شود.
-هویت SSH سرور تازه در اولین اتصال ثبت می‌شود؛ تغییر کلید میزبان قبلی خطا می‌دهد. واردکردن دوبارهٔ همان آدرس و پورت، نصب همان VPS را به‌روز می‌کند.
-
-**Remove VPS** همهٔ تونل‌هایی را که آن VPS در هرکدام از دو سمتشان قرار دارد
-حذف می‌کند و سپس VPS را از فهرست برمی‌دارد. شکست پاک‌سازی یک تونل باعث حفظ
-رکورد VPS برای تلاش مجدد می‌شود.
-
-**VPS Test** دو گزینه دارد:
-
-```text
-1. Check connections from this terminal to all VPSs
-2. Test a tunnel between two VPSs
-0. Back
-```
-
-گزینهٔ اول ورود SSH با کلید را از همین ترمینال به همهٔ VPSها بررسی می‌کند.
-گزینهٔ دوم شمارهٔ دو VPS، دو پورت و Mode را می‌گیرد. Enter برای Local test
-port یک پورت آزاد انتخاب می‌کند. Enter برای Remote service port مقدار 22
-را انتخاب می‌کند. این پورت، پورت سرویس مقصد است. تونل آزمایشی روی loopback
-ساخته می‌شود، تست می‌شود و در پایان با بررسی آزادشدن پورت پاک می‌شود.
-اگر ترمینال هنگام تست بسته شود، سرویس موقت حداکثر پس از 60 ثانیه متوقف
-می‌شود و باقی منابع در اجرای بعدی پاک‌سازی می‌شوند.
-
-### Tunnel
-
-```text
-1. Add Tunnel
-2. Remove Tunnel
-3. Tunnel Test
-0. Back
-```
-
-**Add Tunnel** شمارهٔ Local و Remote را از فهرست VPSها می‌گیرد. سپس Local Port،
-Remote Port و Mode را می‌پرسد. فیلد نام تونل و IP اضافی ندارد. پیش‌فرض Remote
-Port برابر 443 است و Local Port باید مشخص شود.
-
-```text
-1. 91.216.217.244 (this VPS)
-2. uk5.30na.top
-3. gr02.30na.top
-
-Local VPS ID  > 1
-Remote VPS ID > 3
-Local Port   > 6677
-Remote Port  > 443
-Mode [1 Forward, 2 Reverse, 0 Back] > 2
-```
-
-در این مثال، کاربران به `91.216.217.244:6677` وصل می‌شوند. GR02 اتصال SSH را
-به ایران آغاز می‌کند و مقصد TCP برابر `127.0.0.1:443` روی GR02 است.
-شنوندهٔ تونل دائمی روی همهٔ interfaceهای IPv4 سرور Local قرار می‌گیرد.
-پورت انتخاب‌شده باید در firewall سیستم‌عامل و firewall ارائه‌دهنده هم مجاز باشد.
-برنامه فایل‌های firewall ارائه‌دهنده را کنترل نمی‌کند.
-
-**Remove Tunnel** سرویس و اتصال SSH همان تونل را متوقف می‌کند، آزادشدن Local
-Port را بررسی می‌کند و سپس سرویس، کلید و حساب اختصاصی و رکورد آن را پاک می‌کند.
-اگر پورت آزاد نشود، مشخصات فرایند شنونده نمایش داده می‌شود و رکورد تونل باقی
-می‌ماند تا حذف دوباره انجام شود. حذف موفقیت‌آمیز یعنی پورت برای تونل بعدی آزاد است.
-
-برنامه در شروع، سرویس‌های شناخته‌شدهٔ پروژه را که از جدول نسخه‌های قبلی جا
-مانده‌اند بازیابی می‌کند. سرویس بازیابی‌شده در فهرست تونل‌ها قرار می‌گیرد و از
-همان Remove Tunnel حذف می‌شود. برای پورت اشغال‌شده توسط سرویس دیگری، نام و
-PID شنونده نشان داده می‌شود.
-
-**Tunnel Test** همهٔ تونل‌های فعال از هر دو نوع را بررسی می‌کند. خطای یک تونل
-مانع ادامهٔ بقیهٔ تست‌ها نمی‌شود.
-
-| نتیجه | معنی |
-|---|---|
-| SSH | سرویس تونل و شنوندهٔ ناشی از اتصال SSH فعال‌اند |
-| LISTENER | فرایند SSH روی Local Port گوش می‌دهد |
-| TCP | اتصال از تونل عبور کرده و اتصال جدید در مقصد مشاهده شده است |
-
-تست TCP برای سرویس‌هایی مانند Xray که اتصال را مدتی باز نگه می‌دارند مناسب
-است. مشاهدهٔ socket مقصد ممکن است زیر بار هم‌زمان مبهم باشد یا برای سرویس‌های
-بلافاصله‌بسته‌شونده نتیجهٔ FAIL بدهد. ورود پروتکل VPN و IP خروجی را از دستگاه
-کاربر هم تست کن. تایمر بررسی خودکار هر 30 دقیقه اجرا می‌شود.
-
-## انتقال از نسخهٔ قبلی
-
-همان `/opt/tunnel-manager` استفاده می‌شود تا واحدهای systemd، کلیدهای تونل‌های
-قبلی و مسیر نصبشان معتبر بمانند. نصاب از کد و داده‌ها در
-`/var/backups/30na-tunnel/` نسخهٔ پشتیبان می‌گیرد. در اولین اجرا، داده‌های
-`servers.db`، `tunnels.db`، `reverse.json` و `pairs.json` به `data/state.json`
-منتقل می‌شوند. واحدهای موجود و شناسه‌هایشان حفظ می‌شوند. پس از انتقال، همین
-برنامه مرجع مدیریت است. فایل‌های قدیمی برای بازیابی باقی می‌مانند.
-
-ساخت نیمه‌کاره یا حذف ناموفق در داده‌ها ثبت می‌شود. اجرای بعدی برای پاک‌سازی
-آن‌ها تلاش می‌کند. خطای دسترسی به سرور دوردست رکورد مربوط را حفظ می‌کند.
-
-## بررسی و تست توسعه
-
+Alternatively register by IP after verifying that address's host key:
 ```bash
-python3 -m unittest discover -s tests -v
+30na -vps -add -ip 178.83.46.45
+30na -vps -test -all
 ```
+Registration reads the machine ID over SSH. Custom management ports use
+`-ssh-port 2222`. At tunnel creation time both endpoints need Python 3,
+iproute2, systemd, OpenSSH client/server and an sshd configuration including
+/etc/ssh/sshd_config.d/*.conf. Enrollment does not install these on the peer.
 
-پیش‌نیاز تست‌های یکپارچه OpenSSH server/client، iproute2 و p7zip-full است.
-تست‌ها روی VPSهای عملیاتی کاربر اجرا نمی‌شوند و کلید آزمایشی خودشان را می‌سازند.
-تست‌های OpenSSH روی loopback با چند daemon واقعی اجرا می‌شوند. کنترل systemd
-و ساخت حساب سیستم‌عامل در این محیط شبیه‌سازی شده‌اند. پیکربندی تولیدشده جداگانه
-با parser واقعی sshd و systemd بررسی می‌شود. CI برای Ubuntu 22.04 و 24.04 تعریف
-شده است. نتیجهٔ اجرای CI را در بخش Actions مخزن ببین.
+## Create, test and remove a tunnel
+With Iran as local manager (ID 1) and a registered peer (ID 2):
+```bash
+30na -tunnel -add -local 1 -remote 2 -local-port 18443 -remote-port 443 -mode reverse
+30na -tunnel
+30na -vps -tunnel
+```
+Users connect to the Iran IPv4 on port 18443. The peer opens SSH back to Iran
+and delivers traffic to its own 127.0.0.1:443. For Forward, the ingress host
+opens SSH to the destination instead. Both VPS selectors accept IDs, addresses
+and domain names resolving to registered addresses:
+```bash
+30na -tunnel -add -local i.30na.top -remote gr04.30na.top -local-port 15443 -remote-port 443 -mode forward
+30na -tunnel -test -all
+30na -tunnel -remove -id 1
+```
+Use the IDs in your output. Interactive setup is `30na -tunnel -add`.
+Removing a VPS also removes every dependent tunnel in either direction:
+```bash
+30na -vps -remove -id 2
+# Alternative selection by address
+30na -vps -remove -ip 178.83.46.45
+```
+On partial cleanup restore SSH reachability and repeat the removal command.
+If creation was interrupted, find the pending ID with `30na -tunnel` and
+remove it before retrying. Removing a tunnel verifies release of its ingress
+port. The destination service continues running.
 
-## تست پذیرش پیش از اولین Release
+## Read the output
+UP requires a running unit and a matching ingress listener. Tunnel Test checks
+the destination listener and tries a TLS handshake on destination port 443,
+or reads application greeting bytes on other ports. TLS here measures traffic
+flow, with no certificate-identity assertion. A silent service or one needing
+specific SNI, credentials or client payload can show UNVERIFIED. This check
+does not authenticate a VPN user. DOWN units are skipped in active-only tests.
+Exit 0 indicates success, 1 includes unsuccessful/inconclusive checks, and 2
+indicates argparse usage errors. Colors adapt to the terminal; NO_COLOR turns
+them off. Use `30na -h` for modules and `30na -tunnel -h` for syntax.
 
-1. نصب روی IRAN و مشاهدهٔ تونل‌های قبلی.
-2. از Add New VPS، نصب GR02 یا UK5 را با همان نسخه به‌روز کن.
-3. یک Reverse روی پورت آزاد بساز و با کانفیگ Xray مقصد از دستگاه کاربر متصل شو.
-4. تونل را با Remove Tunnel حذف کن.
-5. روی همان Local Port یک Reverse جدید و سپس یک Forward بساز. بعد از هر حذف
-   پورت باید قابل استفاده باشد.
-6. Tunnel Test و هر دو گزینهٔ VPS Test را اجرا کن.
-7. پس از reboot، اتصال تونل دائمی و IP خروجی VPN را دوباره بررسی کن.
-
-نسخهٔ rc برای همین پذیرش منتشر شده است. انتشار اولین Release پس از تأیید کاربر
-انجام می‌شود.
+[Architecture](docs/architecture.md) · [AI contributor guide](AGENTS.md)

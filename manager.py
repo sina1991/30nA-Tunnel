@@ -1,7 +1,9 @@
 #!/usr/bin/env python3
 """30nA-TUNNEL: two-endpoint OpenSSH TCP forwarding and terminal dashboard."""
 from contextlib import contextmanager
-from concurrent.futures import ThreadPoolExecutor
+from contextlib import closing
+import ipaddress
+import sqlite3
 from pathlib import Path
 import fcntl
 import json
@@ -12,18 +14,17 @@ import shlex
 import socket
 import subprocess
 import sys
-import tempfile
 import time
 
-BASE = Path("/opt/tunnel-manager")
+BASE = Path("/var/lib/30na")
 DATA = BASE / "data"
-VERSION = "2.0.0-rc.2"
+DEFAULT_KEY = "/root/.ssh/30na_windows"
 HOST = re.compile(r"[A-Za-z0-9][A-Za-z0-9.-]{0,252}")
 ERRORS = (ValueError, KeyError, OSError, RuntimeError, subprocess.SubprocessError)
 SSH_OPTIONS = ["-o", "BatchMode=yes", "-o", "ConnectTimeout=8",
                "-o", "StrictHostKeyChecking=yes", "-o", "ServerAliveInterval=15",
                "-o", "ServerAliveCountMax=2"]
-STATE = DATA / "state.json"
+STATE = DATA / "registry.sqlite3"
 
 
 def run(args, *, check=True, data=None, timeout=30):
@@ -42,24 +43,6 @@ def text(result):
     return result.stdout.decode(errors="replace").strip()
 
 
-def atomic_write(path, contents):
-    path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
-    descriptor, temporary = tempfile.mkstemp(dir=path.parent, prefix=path.name + ".")
-    try:
-        with os.fdopen(descriptor, "w") as stream:
-            stream.write(contents)
-            stream.flush()
-            os.fsync(stream.fileno())
-        os.replace(temporary, path)
-        directory = os.open(path.parent, os.O_RDONLY | os.O_DIRECTORY)
-        try:
-            os.fsync(directory)
-        finally:
-            os.close(directory)
-    finally:
-        Path(temporary).unlink(missing_ok=True)
-
-
 @contextmanager
 def locked():
     DATA.mkdir(parents=True, exist_ok=True, mode=0o700)
@@ -70,11 +53,7 @@ def locked():
 
 def ssh_command(endpoint):
     args = ["ssh", *SSH_OPTIONS, "-p", str(endpoint.get("ssh_port", 22))]
-    filenames = ("30na_windows",) if endpoint.get("bootstrap") else ("30na_tunnel_manager", "30na_windows")
-    for filename in filenames:
-        key = Path("/root/.ssh") / filename
-        if key.is_file():
-            args += ["-i", str(key)]
+    args += ["-i", endpoint.get("key", DEFAULT_KEY)]
     args += ["-o", "IdentitiesOnly=yes"]
     return [*args, f"{endpoint.get('user', 'root')}@{endpoint['host']}"]
 
@@ -86,72 +65,6 @@ def execute(endpoint, args, **kwargs):
         return run([*ssh_command(endpoint), shlex.join(list(map(str, args)))], **kwargs)
     except RuntimeError as error:
         raise RuntimeError(f"SSH {endpoint['host']}:{endpoint.get('ssh_port', 22)} — {error}") from error
-
-
-def save(state):
-    atomic_write(STATE, json.dumps(state, indent=2) + "\n")
-
-
-def host_address():
-    addresses = text(run(["hostname", "-I"], check=False)).split()
-    return next((address for address in addresses if "." in address), socket.gethostname())
-
-
-def migrate():
-    """Import all existing databases once, keeping legacy units and key paths."""
-    servers = {}
-    server_db = DATA / "servers.db"
-    if server_db.exists():
-        for line in server_db.read_text().splitlines():
-            if not line.strip():
-                continue
-            parts = line.split("|")
-            if len(parts) != 3 or not parts[0].isdigit() or not HOST.fullmatch(parts[1]):
-                raise ValueError("Invalid legacy servers.db. Original files were preserved.")
-            sid, host, user = parts
-            servers[sid] = dict(host=host, user=user, ssh_port=22)
-    local_id = "1" if "1" not in servers else str(max(map(int, servers), default=0) + 1)
-    servers[local_id] = dict(host=host_address(), user="root", ssh_port=22, dashboard=True)
-    tunnels = {}
-    forward_db = DATA / "tunnels.db"
-    if forward_db.exists():
-        for line in forward_db.read_text().splitlines():
-            if not line.strip():
-                continue
-            parts = line.split("|")
-            if len(parts) != 6:
-                raise ValueError("Invalid legacy tunnels.db. Original files were preserved.")
-            tid, name, sid, listen, target, bind = parts
-            tunnels[tid] = dict(name=name, server=sid, listen=int(listen),
-                                target=int(target), bind=bind, kind="Forward")
-    for filename in ("reverse.json", "pairs.json"):
-        path = DATA / filename
-        if path.exists():
-            tunnels.update(json.loads(path.read_text()))
-    for tid, tunnel in tunnels.items():
-        if not tid.isdigit() or not 1 <= tunnel["listen"] <= 65535 or not 1 <= tunnel["target"] <= 65535:
-            raise ValueError("Invalid legacy tunnel. Original files were preserved.")
-        target = tunnel.get("dashboard_target")
-        tunnel["remote_id"] = local_id if target else tunnel.get("server")
-        tunnel["local_id"] = tunnel.get("local_id") or local_id
-        tunnel["legacy"] = True
-        tunnel["unit"] = (f"{tunnel['account']}.service" if tunnel.get("account")
-                          else f"ssh-tunnel-{tid}.service")
-        tunnel["phase"] = "ready"
-    checks_path = DATA / "checks.json"
-    checks = json.loads(checks_path.read_text()) if checks_path.exists() else {}
-    return dict(schema=1, servers=servers, local_id=local_id, tunnels=tunnels, checks=checks)
-
-
-def load():
-    if STATE.exists():
-        state = json.loads(STATE.read_text())
-        if state.get("schema") != 1:
-            raise ValueError("Unsupported state version.")
-        return state
-    state = migrate()
-    save(state)
-    return state
 
 
 def endpoints(state, tunnel):
@@ -183,7 +96,7 @@ def listeners(endpoint, port):
 
 
 PORT_PROBE = """
-import errno, json, socket, sys
+import json, socket, sys
 s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
 s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
 try:
@@ -324,7 +237,12 @@ WantedBy=multi-user.target
 def listener_matches(endpoint, tunnel):
     result = listeners(endpoint, tunnel["listen"])
     processes = ('"sshd",pid=', '"sshd-session",pid=') if tunnel["kind"] == "Reverse" else ('"ssh",pid=',)
-    return bool(result) and any(process in result for process in processes)
+    for row in result.splitlines():
+        fields = row.split()
+        if len(fields) >= 4 and fields[3] in (f"{tunnel['bind']}:{tunnel['listen']}", f"*:{tunnel['listen']}"):
+            if any(process in row for process in processes):
+                return True
+    return False
 
 
 def start_tunnel(state, tunnel):
@@ -366,7 +284,7 @@ def new_tunnel(state, local_id, remote_id, listen, target, kind, bind="0.0.0.0",
     save(state)
     try:
         start_tunnel(state, tunnel)
-    except (KeyboardInterrupt, *ERRORS) as error:
+    except (KeyboardInterrupt,) + ERRORS as error:
         tunnel["phase"] = "cleanup"
         tunnel["error"] = str(error) or "Creation interrupted"
         save(state)
@@ -396,7 +314,10 @@ def remove_tunnel(state, tid):
     tunnel["phase"] = "deleting"
     save(state)
     # Stop and verify even if the unit file has already been removed.
-    loaded = text(execute(client, ["systemctl", "show", "-p", "LoadState", "--value", tunnel["unit"]]))
+    query = execute(client, ["systemctl", "show", "-p", "LoadState", "--value", tunnel["unit"]], check=False)
+    loaded = text(query)
+    if loaded != "not-found" and (query.returncode or not loaded):
+        raise RuntimeError(f"Unable to verify unit {tunnel['unit']} on {client['host']}.")
     if loaded != "not-found":
         unit_action(state, tunnel, ["disable", "--now"])
         if service_state(state, tunnel) in ("UP", "STARTING", "STOPPING"):
@@ -420,98 +341,6 @@ def remove_tunnel(state, tid):
     del state["tunnels"][tid]
     state["checks"].pop(tid, None)
     save(state)
-
-
-SOCKETS = """
-import json, subprocess, sys
-result = subprocess.run(['ss', '-Hnt', 'state', 'established', 'sport = :' + sys.argv[1]],
-                        check=True, capture_output=True, text=True)
-rows = []
-for line in result.stdout.splitlines():
-    parts = line.split()
-    if len(parts) >= 4 and '127.0.0.1:' in line:
-        rows.append(parts[-2:])
-print(json.dumps(rows))
-"""
-
-
-def target_sockets(endpoint, port):
-    return {tuple(pair) for pair in json.loads(text(execute(endpoint, ["python3", "-c", SOCKETS, str(port)])))}
-
-
-HOLD = """
-import socket, sys, time
-with socket.create_connection((sys.argv[1], int(sys.argv[2])), 3) as connection:
-    time.sleep(3)
-"""
-
-
-def tcp_path(state, tunnel):
-    local, remote = endpoints(state, tunnel)
-    baseline = target_sockets(remote, tunnel["target"])
-    with ThreadPoolExecutor(max_workers=1) as pool:
-        probe = pool.submit(execute, local, ["python3", "-c", HOLD,
-                            "127.0.0.1" if tunnel["bind"] == "0.0.0.0" else tunnel["bind"],
-                            str(tunnel["listen"])], check=False)
-        observed = False
-        while not probe.done():
-            if target_sockets(remote, tunnel["target"]) - baseline:
-                observed = True
-                break
-            time.sleep(0.15)
-        result = probe.result()
-    return observed and result.returncode == 0
-
-
-def test_tunnel(state, tid):
-    tunnel = state["tunnels"][tid]
-    result = dict(ssh=False, listener=False, tcp=False,
-                  checked=time.strftime("%Y-%m-%d %H:%M:%S %Z"))
-    try:
-        local, remote = endpoints(state, tunnel)
-        execute(local, ["true"])
-        execute(remote, ["true"])
-        result["listener"] = listener_matches(local, tunnel)
-        result["ssh"] = service_state(state, tunnel) == "UP" and result["listener"]
-        if result["ssh"]:
-            result["tcp"] = tcp_path(state, tunnel)
-    except ERRORS as error:
-        result["error"] = str(error)
-    state["checks"][tid] = result
-    save(state)
-    return result
-
-
-def passed(result):
-    return not result.get("error") and all(result.get(key) for key in ("ssh", "listener", "tcp"))
-
-
-def test_all(state, active_only=False):
-    good = checked = unavailable = 0
-    print("ID   MODE      SSH    LISTENER  TCP    RESULT")
-    for tid, tunnel in list(state["tunnels"].items()):
-        try:
-            status = service_state(state, tunnel)
-            if active_only and status == "UNKNOWN":
-                raise RuntimeError("Service state unavailable")
-            if active_only and status != "UP":
-                print(f"{tid:<4} {tunnel['kind']:<9} skipped ({status})")
-                continue
-            checked += 1
-            result = test_tunnel(state, tid)
-            good += int(passed(result))
-            print(f"{tid:<4} {tunnel['kind']:<9} {word(result['ssh']):<6} "
-                  f"{word(result['listener']):<9} {word(result['tcp']):<6} {word(passed(result))}", flush=True)
-            if result.get("error"):
-                print(f"     {result['error']}", flush=True)
-        except ERRORS as error:
-            unavailable += 1
-            state["checks"][tid] = dict(ssh=False, listener=False, tcp=False, error=str(error),
-                                        checked=time.strftime("%Y-%m-%d %H:%M:%S %Z"))
-            save(state)
-            print(f"{tid}: FAIL — {error}", flush=True)
-    print(f"{good}/{checked} passed; {unavailable} unavailable.")
-    return good == checked and unavailable == 0
 
 
 def color(value, code):
@@ -578,111 +407,6 @@ def select_endpoints(state):
     return local_id, remote_id
 
 
-def add_tunnel(state):
-    pair = select_endpoints(state)
-    if pair is None:
-        return
-    local_id, remote_id = pair
-    listen = input_port("Local Port")
-    target = input_port("Remote Port", 443)
-    kind = select_mode()
-    if kind is None:
-        return
-    tid = new_tunnel(state, local_id, remote_id, listen, target, kind)
-    print(color(f"Tunnel {tid} is UP.", "1;32"))
-    print(f"Listener: {state['servers'][local_id]['host']}:{listen}")
-    print(f"Target:   {state['servers'][remote_id]['host']}:127.0.0.1:{target}")
-
-
-PUBLIC_REGISTER = r"""
-import pathlib, subprocess, sys
-key = sys.stdin.buffer.read()
-parts = key.decode().split()
-if len(parts) < 2 or parts[0] != 'ssh-ed25519':
-    raise SystemExit('Invalid management public key')
-home = pathlib.Path('/root/.ssh')
-home.mkdir(mode=0o700, exist_ok=True)
-authorized = home / 'authorized_keys'
-if authorized.is_symlink():
-    raise SystemExit('Refusing symlink authorized_keys')
-existing = authorized.read_bytes() if authorized.exists() else b''
-fingerprint = subprocess.run(['ssh-keygen','-lf','-'], input=key,
-                             check=True, capture_output=True).stdout.split()[1]
-listed = subprocess.run(['ssh-keygen','-lf','-'], input=existing,
-                        capture_output=True).stdout.splitlines()
-if not any(len(line.split()) > 1 and line.split()[1] == fingerprint for line in listed):
-    with authorized.open('ab') as stream:
-        if existing and not existing.endswith(b'\n'):
-            stream.write(b'\n')
-        stream.write(key.rstrip(b'\n') + b'\n')
-authorized.chmod(0o600)
-"""
-
-
-def register_management(endpoint):
-    if endpoint.get("dashboard"):
-        return
-    public = Path("/root/.ssh/30na_tunnel_manager.pub").read_bytes()
-    execute(endpoint, ["python3", "-c", PUBLIC_REGISTER], data=public)
-    # Confirm access without any interactive agent before calling a VPS ready.
-    command = ["env", "-u", "SSH_AUTH_SOCK", "ssh", *SSH_OPTIONS,
-               "-i", "/root/.ssh/30na_tunnel_manager", "-o", "IdentitiesOnly=yes",
-               "-p", str(endpoint.get("ssh_port", 22)),
-               f"{endpoint.get('user','root')}@{endpoint['host']}", "true"]
-    run(command)
-
-
-def enroll_server(state):
-    host = input("VPS address [e.g. gr02.30na.top]: ").strip()
-    if not HOST.fullmatch(host):
-        raise ValueError("Enter an IPv4 address or a DNS hostname.")
-    port = input_port("SSH Port", 22)
-    endpoint = dict(host=host, ssh_port=port, user="root")
-    admin_key = Path("/root/.ssh/30na_windows")
-    if not admin_key.is_file() or not admin_key.with_suffix(".pub").is_file():
-        raise ValueError("Restore the ZIP key pair with install.sh before adding a VPS.")
-    endpoint["bootstrap"] = True
-    # A fresh VPS only needs root SSH and a shell. No Python is invoked here.
-    print(f"Connecting to root@{host}:{port} with the ZIP key...", flush=True)
-    command = ssh_command(endpoint)
-    strict = command.index("StrictHostKeyChecking=yes")
-    command[strict] = "StrictHostKeyChecking=accept-new"
-    command += ["true"]
-    run(command)
-    machine = endpoint_identity(endpoint)
-    if machine == endpoint_identity(state["servers"][state["local_id"]]):
-        raise ValueError("The dashboard VPS is already registered.")
-    for sid, current in state["servers"].items():
-        current_machine = current.get("machine_id")
-        if current.get("dashboard"):
-            current_machine = endpoint_identity(current)
-        if current_machine == machine and current["host"] != host:
-            raise ValueError(f"This VPS is already registered as {sid} ({current['host']}).")
-    revision = (BASE / "revision").read_text().strip()
-    if not re.fullmatch(r"[0-9a-f]{40}", revision):
-        raise ValueError("Reinstall the project to register its revision.")
-    print("Installing 30nA-TUNNEL on the VPS...", flush=True)
-    result = execute(endpoint, ["bash", "-s", "--", "--peer", revision],
-                     data=(BASE / "install.sh").read_bytes(), timeout=900)
-    print(text(result))
-    if execute(endpoint, ["cat", str(BASE / "manager.py")]).stdout != (BASE / "manager.py").read_bytes():
-        raise RuntimeError("The peer did not install the selected version.")
-    print("Checking the installed VPS...", flush=True)
-    execute(endpoint, ["python3", "-c", "import sys; print(sys.version.split()[0])"])
-    manager_key = Path("/root/.ssh/30na_tunnel_manager")
-    if not manager_key.is_file():
-        run(["ssh-keygen", "-q", "-t", "ed25519", "-N", "", "-f", str(manager_key)])
-    register_management(endpoint)
-    endpoint.pop("bootstrap")
-    sid = next((key for key, server in state["servers"].items()
-                if server["host"] == host and server.get("ssh_port", 22) == port), None)
-    sid = sid or str(max(map(int, state["servers"]), default=0) + 1)
-    endpoint["machine_id"] = machine
-    state["servers"][sid] = endpoint
-    save(state)
-    print(f"VPS {sid} installed and registered.")
-
-
 def remove_server(state, sid):
     if sid == state["local_id"]:
         raise ValueError("The current dashboard VPS cannot be removed.")
@@ -698,254 +422,50 @@ def remove_server(state, sid):
     print(f"VPS {sid} and {len(related)} tunnel(s) removed.")
 
 
-def vps_test(state):
-    print("1. Check connections from this terminal to all VPSs")
-    print("2. Test a tunnel between two VPSs")
-    print("0. Back")
-    choice = input("Select > ").strip()
-    if choice == "0":
-        return
-    if choice == "1":
-        for sid, endpoint in state["servers"].items():
-            try:
-                execute(endpoint, ["true"])
-                print(f"{sid}. {endpoint['host']}  {word(True)}")
-            except ERRORS as error:
-                print(f"{sid}. {endpoint['host']}  {word(False)}  {error}")
-        return
-    if choice != "2":
-        raise ValueError("Choose 1, 2, or 0.")
-    pair = select_endpoints(state)
-    if pair is None:
-        return
-    local_id, remote_id = pair
-    listen = input_port("Local test port", 0)
-    target = input_port("Remote service port", 22)
-    kind = select_mode()
-    if kind is None:
-        return
-    local = state["servers"][local_id]
-    listen = ensure_free(local, listen, "127.0.0.1")
-    # Uses exactly the same provisioning, data path, cleanup and port-release checks.
-    tid = new_tunnel(state, local_id, remote_id, listen, target, kind, bind="127.0.0.1", temporary=True)
-    try:
-        result = test_tunnel(state, tid)
-        print(f"SSH {word(result['ssh'])}  LISTENER {word(result['listener'])}  TCP {word(result['tcp'])}")
-        if result.get("error"):
-            print(result["error"])
-    finally:
-        remove_tunnel(state, tid)
-        print(f"Temporary tunnel removed. Port {listen} released.")
+
+def save(state):
+    DATA.mkdir(parents=True, mode=0o700, exist_ok=True)
+    with closing(sqlite3.connect(STATE)) as db, db:
+        db.execute("CREATE TABLE IF NOT EXISTS registry (id INTEGER PRIMARY KEY CHECK(id=1), body TEXT NOT NULL)")
+        db.execute("INSERT OR REPLACE INTO registry VALUES (1, ?)", (json.dumps(state),))
 
 
-def dashboard(state):
-    clear_screen()
-    local = state["servers"][state["local_id"]]
-    print(color(f"30nA-TUNNEL {VERSION}", "1;36"))
-    print(f"{socket.gethostname()}  ·  {local['host']}  ·  {time.strftime('%H:%M')}")
-    print(color("\nVPS", "1;36"))
-    print(f"{'ID':<4} {'HOST':<30} {'SSH':<12} DNS CHECK")
-    with ThreadPoolExecutor(max_workers=min(8, len(state["servers"]))) as pool:
-        jobs = {sid: pool.submit(execute, endpoint, ["true"], check=False)
-                for sid, endpoint in state["servers"].items()}
-        for sid, endpoint in state["servers"].items():
-            try:
-                ok = jobs[sid].result().returncode == 0
-                status = "LOCAL" if endpoint.get("dashboard") else ("OK" if ok else "FAIL")
-            except ERRORS:
-                status = "UNKNOWN"
-            # getent is bounded so an unavailable resolver cannot hang the UI.
-            try:
-                resolved = execute(local, ["getent", "ahostsv4", endpoint["host"]], check=False, timeout=3)
-                dns = "OK" if resolved.returncode == 0 else "FAIL"
-            except ERRORS:
-                dns = "UNKNOWN"
-            print(f"{sid:<4} {endpoint['host']:<30} {color(status, '32' if status in ('LOCAL','OK') else '31'):<21} "
-                  f"{dns} ({time.strftime('%H:%M')})")
-    print(color("\nTUNNELS", "1;36"))
-    print(f"{'ID':<4} {'MODE':<9} {'LOCAL VPS:PORT':<29} {'REMOTE VPS:PORT':<29} {'STATE':<12} TEST")
-    for tid, tunnel in state["tunnels"].items():
+def local_endpoint():
+    ips = []
+    for value in text(run(["hostname", "-I"])).split():
+        address = ipaddress.ip_address(value)
+        if address.version == 4 and not address.is_loopback:
+            ips.append(value)
+    if not ips:
+        raise ValueError("No local IPv4 address found.")
+    ip = os.environ.get("THIRTYNA_LOCAL_IPV4") or ips[0]
+    if ip not in ips:
+        raise ValueError("THIRTYNA_LOCAL_IPV4 must be assigned on this host.")
+    if len(ips) > 1 and not os.environ.get("THIRTYNA_LOCAL_IPV4"):
+        print("Local IPv4 addresses:", ", ".join(ips))
+        ip = input(f"Local IPv4 [e.g. {ip}]: ").strip()
+        if ip not in ips:
+            raise ValueError("Choose a listed IPv4 address.")
+    peer = dict(host=ip, ip=ip, dashboard=True, machine_id=Path("/etc/machine-id").read_text().strip())
+    name = socket.getfqdn().lower()
+    if "." in name and name != ip and HOST.fullmatch(name):
         try:
-            listener, target = endpoints(state, tunnel)
-            status = service_state(state, tunnel)
-            phase = tunnel.get("phase", "ready")
-            if phase != "ready":
-                status = phase.upper()
-            result = state["checks"].get(tid)
-            checked = word(passed(result)) if result else "—"
-            if result:
-                checked += " " + result.get("checked", "")
-            print(f"{tid:<4} {tunnel['kind']:<9} "
-                  f"{listener['host'] + ':' + str(tunnel['listen']):<29} "
-                  f"{target['host'] + ':' + str(tunnel['target']):<29} "
-                  f"{color(f'{status:<12}', '32' if status == 'UP' else '33')} {checked}")
-        except ERRORS as error:
-            print(f"{tid}  {color('UNKNOWN', '31')}  {error}")
-    if not state["tunnels"]:
-        print("No tunnels configured.")
+            if socket.gethostbyname(name) == ip:
+                peer["domain"] = name
+        except socket.gaierror:
+            pass
+    return peer
 
 
-MENUS = {
-    "home": "1. VPS\n2. Tunnel\n0. Exit",
-    "vps": "1. Add New VPS\n2. Remove VPS\n3. VPS Test\n0. Back",
-    "tunnel": "1. Add Tunnel\n2. Remove Tunnel\n3. Tunnel Test\n0. Back",
-}
-
-
-def cli():
-    section = "home"
-    try:
-        while True:
-            with locked():
-                state = load()
-            dashboard(state)
-            print(color("\n" + section.upper(), "1;37"))
-            print(MENUS[section])
-            choice = input("Select > ").strip()
-            if choice == "0":
-                if section == "home":
-                    clear_screen()
-                    return
-                section = "home"
-                continue
-            if section == "home" and choice in ("1", "2"):
-                section = "vps" if choice == "1" else "tunnel"
-                continue
-            dashboard(state)
-            try:
-                if choice not in ("1", "2", "3") or section == "home":
-                    raise ValueError("Choose one of the numbered options.")
-                with locked():
-                    state = load()
-                    if section == "vps":
-                        if choice == "1":
-                            enroll_server(state)
-                        elif choice == "2":
-                            sid = select_id({key: value for key, value in state["servers"].items()
-                                             if key != state["local_id"]}, "VPS")
-                            if sid is not None:
-                                remove_server(state, sid)
-                        else:
-                            vps_test(state)
-                    elif choice == "1":
-                        add_tunnel(state)
-                    elif choice == "2":
-                        tid = select_id(state["tunnels"], "Tunnel")
-                        if tid is not None:
-                            remove_tunnel(state, tid)
-                            print(f"Tunnel {tid} removed. Local port released.")
-                    else:
-                        test_all(state, active_only=True)
-            except ERRORS as error:
-                print(color(f"Error: {error}", "31"))
-            input("\nEnter to return > ")
-    except (EOFError, KeyboardInterrupt):
-        return
-
-
-def same_address(left, right):
-    if left == right:
-        return True
-    try:
-        left_ips = {row[4][0] for row in socket.getaddrinfo(left, None, socket.AF_INET)}
-        right_ips = {row[4][0] for row in socket.getaddrinfo(right, None, socket.AF_INET)}
-        return bool(left_ips & right_ips)
-    except socket.gaierror:
-        return False
-
-
-def discover_services(state):
-    """Recover known project units left out of an older database after failed removal."""
-    known = set()
-    for tunnel in state["tunnels"].values():
-        try:
-            client, _ = participants(state, tunnel)
-            known.add((client["host"], client.get("ssh_port", 22), tunnel["unit"]))
-        except ERRORS:
-            continue
-    for client_id, client in state["servers"].items():
-        try:
-            listing = text(execute(client, ["systemctl", "list-units", "--all", "--type=service",
-                           "--plain", "--no-legend", "--no-pager", "ssh-tunnel-*",
-                           "stm-r-*", "nt-*", "gr02-iran-reverse.service"]))
-            units = {line.split()[0] for line in listing.splitlines() if line.split()}
-            for unit in sorted(units):
-                if not re.fullmatch(r"(?:ssh-tunnel-[0-9]+|stm-r-[a-z0-9]+|nt-[a-z0-9]+|gr02-iran-reverse)\.service", unit):
-                    continue
-                if (client["host"], client.get("ssh_port", 22), unit) in known:
-                    continue
-                command = text(execute(client, ["systemctl", "show", "-p", "ExecStart", "--value", unit]))
-                match = re.search(r"argv\[\]=(.*?);", command)
-                if not match:
-                    continue
-                args = shlex.split(match.group(1).strip())
-                if not args or args[0] != "/usr/bin/ssh":
-                    continue
-                flag = "-R" if "-R" in args else "-L" if "-L" in args else None
-                if flag is None:
-                    continue
-                bind, listen, target_host, target = args[args.index(flag) + 1].split(":")
-                if bind not in ("0.0.0.0", "127.0.0.1") or target_host != "127.0.0.1":
-                    continue
-                if not listen.isdecimal() or not target.isdecimal():
-                    continue
-                destination = args[-1].split("@")
-                if len(destination) != 2:
-                    continue
-                destination_user, host = destination
-                ssh_port = int(args[args.index("-p") + 1]) if "-p" in args else 22
-                server_id = next((sid for sid, endpoint in state["servers"].items()
-                                  if endpoint.get("ssh_port",22) == ssh_port and same_address(endpoint["host"], host)), None)
-                if server_id is None or server_id == client_id:
-                    continue
-                local_id, remote_id = ((client_id,server_id) if flag == "-L" else (server_id,client_id))
-                tid = str(max(state.get("sequence",0), max(map(int,state["tunnels"]),default=0))+1)
-                tunnel = dict(local_id=local_id,remote_id=remote_id,kind="Forward" if flag=="-L" else "Reverse",
-                              listen=int(listen),target=int(target),bind=bind,unit=unit,phase="ready",
-                              legacy=not destination_user.startswith("nt-"), recovered=True)
-                if destination_user.startswith(("nt-","stm-r-")):
-                    tunnel["account"] = destination_user
-                state["tunnels"][tid] = tunnel
-                state["sequence"] = int(tid)
-                save(state)
-                print(f"Recovered service {unit} as tunnel {tid} on port {listen}.", flush=True)
-        except ERRORS as error:
-            print(f"Service discovery on {client['host']}: {error}", flush=True)
-
-
-def recover_pending(state):
-    for tid, tunnel in list(state["tunnels"].items()):
-        if tunnel.get("phase", "ready") != "ready" or tunnel.get("temporary"):
-            try:
-                remove_tunnel(state, tid)
-                print(f"Recovered tunnel {tid}; port released.", flush=True)
-            except ERRORS as error:
-                print(f"Tunnel {tid} needs cleanup retry: {error}", flush=True)
-
-
-def main():
-    if os.geteuid() != 0:
-        sys.exit("Run as root.")
-    os.umask(0o077)
-    try:
-        if sys.argv[1:] in (["--health"], ["--migrate"]):
-            with locked():
-                state = load()
-                if sys.argv[1:] == ["--health"]:
-                    recover_pending(state)
-                    if not test_all(state):
-                        sys.exit(1)
-        elif not sys.argv[1:]:
-            with locked():
-                state = load()
-                discover_services(state)
-                recover_pending(state)
-            cli()
-        else:
-            sys.exit("Usage: 30na-tunnel.sh")
-    except ERRORS as error:
-        sys.exit(str(error))
-
-
-if __name__ == "__main__":
-    main()
+def load():
+    if STATE.exists():
+        with closing(sqlite3.connect(STATE)) as db:
+            row = db.execute("SELECT body FROM registry WHERE id=1").fetchone()
+        if row:
+            state = json.loads(row[0])
+            if state.get("schema") != 1:
+                raise ValueError("Unsupported registry version")
+            return state
+    state = dict(schema=1, local_id="1", servers={"1": local_endpoint()}, tunnels={}, checks={})
+    save(state)
+    return state

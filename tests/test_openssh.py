@@ -23,6 +23,8 @@ import unittest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 import manager as m
+import health
+import cli
 
 
 def free_port():
@@ -47,6 +49,7 @@ def result(value="",code=0):
 class Echo(socketserver.BaseRequestHandler):
     def handle(self):
         try:
+            self.request.sendall(b"READY")
             while True:
                 data = self.request.recv(8192)
                 if not data:
@@ -73,7 +76,7 @@ class OpenSSHTests(unittest.TestCase):
         self.streams = []
         self.stack = ExitStack()
         self.addCleanup(self.close)
-        self.user = getpass.getuser()
+        self.user = getpass.getuser() if os.geteuid() else "root"
         self.key = self.base/"admin"
         subprocess.run(["ssh-keygen","-qt","ed25519","-N","","-f",str(self.key)],check=True)
         self.servers = {}
@@ -216,6 +219,7 @@ class OpenSSHTests(unittest.TestCase):
     def echo_through(self,port):
         with socket.create_connection(("127.0.0.1",port),timeout=3) as connection:
             message=os.urandom(4096)
+            self.assertEqual(connection.recv(5, socket.MSG_WAITALL), b"READY")
             connection.sendall(message)
             received=b""
             while len(received)<len(message):
@@ -226,7 +230,7 @@ class OpenSSHTests(unittest.TestCase):
         port=free_port()
         tid=m.new_tunnel(self.state,local,remote,port,self.target,kind)
         self.echo_through(port)
-        self.assertTrue(m.passed(m.test_tunnel(self.state,tid)))
+        self.assertEqual(health.check(self.state,tid,health.status(self.state,self.state["tunnels"][tid]))[0],"OK")
         m.remove_tunnel(self.state,tid)
         self.assertTrue(m.port_status(self.servers[local],port)["free"])
         self.assertNotIn(tid,m.load()["tunnels"])
@@ -254,7 +258,7 @@ class OpenSSHTests(unittest.TestCase):
     def test_all_active_tunnels(self):
         for kind in ("Forward","Reverse"):
             m.new_tunnel(self.state,"1","2",free_port(),self.target,kind)
-        self.assertTrue(m.test_all(self.state,active_only=True))
+        self.assertTrue(cli.tunnel_tests(self.state,self.state["tunnels"],cli.snapshot(self.state),True))
         for tid in list(self.state["tunnels"]):
             m.remove_tunnel(self.state,tid)
 
@@ -266,9 +270,7 @@ class OpenSSHTests(unittest.TestCase):
 
     def test_stopped_target_fails_tcp_health(self):
         tid=m.new_tunnel(self.state,"1","2",free_port(),free_port(),"Reverse")
-        result=m.test_tunnel(self.state,tid)
-        self.assertTrue(result["listener"])
-        self.assertFalse(result["tcp"])
+        self.assertEqual(health.check(self.state,tid,"UP")[0],"FAIL")
         m.remove_tunnel(self.state,tid)
 
     def test_ssh_process_restart_keeps_tunnel_config(self):
